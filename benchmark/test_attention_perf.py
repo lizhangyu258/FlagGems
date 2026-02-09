@@ -8,8 +8,8 @@ import torch
 import triton
 
 import flag_gems
-
 from benchmark.attri_util import FLOAT_DTYPES
+
 from .performance_utils import Benchmark, GenericBenchmark, SkipVersion, vendor_name
 
 
@@ -622,9 +622,7 @@ def torch_concat_and_cache_mla_ref(
 ) -> None:
     kv_lora_rank = kv_c.size(1)
     block_size = kv_cache.size(1)
-    temp_cache = torch.zeros(
-        kv_cache.shape, dtype=kv_c.dtype, device=kv_cache.device
-    )
+    temp_cache = torch.zeros(kv_cache.shape, dtype=kv_c.dtype, device=kv_cache.device)
 
     for token_idx in range(slot_mapping.numel()):
         slot = slot_mapping[token_idx].item()
@@ -635,7 +633,9 @@ def torch_concat_and_cache_mla_ref(
 
     if kv_cache_dtype != "auto":
         scale_val = scale.item() if scale is not None else 1.0
-        kv_cache.copy_((temp_cache / scale_val).to(torch.float8_e4m3fn).view(torch.uint8))
+        kv_cache.copy_(
+            (temp_cache / scale_val).to(torch.float8_e4m3fn).view(torch.uint8)
+        )
     else:
         kv_cache.copy_(temp_cache)
 
