@@ -306,3 +306,7 @@ PerTokenGroupQuantFp8Benchmark:
     - [7, 512, 512]
     - [83, 512, 64]
 
+ReshapeAndCacheFlashBenchmark:
+  shapes:
+    - [42, 8, 64, 8, 1024]
+    - [42, 8, 80, 16, 10000]

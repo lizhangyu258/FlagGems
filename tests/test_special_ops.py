@@ -781,7 +781,6 @@ def test_pad(shape, dtype, pad_mode, contiguous):
     gems_assert_equal(res_out, ref_out)
 
 
-@pytest.mark.skipif(flag_gems.vendor_name == "cambricon", reason="fix")
 @pytest.mark.upsample_bicubic2d_aa
 @pytest.mark.parametrize("align_corners", [False, True])
 @pytest.mark.parametrize("scale", [(2, 2), (2.1, 3.7), (1.3, 5.1), (0.3, 0.7)])
@@ -1676,8 +1675,8 @@ except ImportError:
 
 # ref: https://github.com/vllm-project/vllm/blob/main/tests/kernels/moe/test_moe.py
 @pytest.mark.moe_align_block_size
-@pytest.mark.parametrize("num_experts", [32, 256, 512])
-@pytest.mark.parametrize("block_size", [8, 16, 32])
+@pytest.mark.parametrize("num_experts", [10, 128, 250, 512])
+@pytest.mark.parametrize("block_size", [16, 32, 64])
 @pytest.mark.parametrize(
     "topk_ids_shape",
     [
