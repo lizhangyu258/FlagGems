@@ -5,6 +5,14 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    import triton.experimental.tle.language.gpu as tle
+
+    HAS_TLE = True
+except ImportError:
+    HAS_TLE = False
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,13 +24,69 @@ def round_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
 
 
-@triton.jit(do_not_specialize=["numel", "tokens_per_thread"])
+@triton.jit(do_not_specialize=["numel"])
+def moe_align_block_size_stage1_tle(
+    topk_ids_ptr,
+    tokens_cnts_ptr,
+    num_experts: tl.constexpr,
+    numel,
+    tokens_per_thread: tl.constexpr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    numel_sorted_token_ids: tl.constexpr,
+    numel_expert_ids: tl.constexpr,
+    block_size_sorted: tl.constexpr,
+    block_size_expert: tl.constexpr,
+    BLOCK_EXPERT: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    offsets_sorted = pid * block_size_sorted + tl.arange(0, block_size_sorted)
+    mask_sorted = offsets_sorted < numel_sorted_token_ids
+    tl.store(sorted_token_ids_ptr + offsets_sorted, numel, mask=mask_sorted)
+
+    offsets_expert = pid * block_size_expert + tl.arange(0, block_size_expert)
+    mask_expert = offsets_expert < numel_expert_ids
+    tl.store(expert_ids_ptr + offsets_expert, 0, mask=mask_expert)
+
+    start_idx = pid * tokens_per_thread
+    off_c = (pid + 1) * num_experts
+
+    offsets = start_idx + tl.arange(0, tokens_per_thread)
+    mask = offsets < numel
+    expert_id = tl.load(topk_ids_ptr + offsets, mask=mask, other=0).to(tl.int32)
+    valid = mask & (expert_id < num_experts)
+    expert_id = tl.where(valid, expert_id, 0)
+
+    expert_offsets = tl.arange(0, BLOCK_EXPERT)
+    expert_mask = expert_offsets < num_experts
+
+    smem_counts = tle.alloc(
+        [BLOCK_EXPERT],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.smem,
+        nv_mma_shared_layout=False,
+    )
+    smem_ptrs = tle.local_ptr(smem_counts, (expert_offsets,))
+    tl.store(smem_ptrs, 0)
+    tl.debug_barrier()
+
+    count_ptrs = tle.local_ptr(smem_counts, (expert_id,))
+    tl.atomic_add(count_ptrs, 1, mask=valid, sem="relaxed", scope="cta")
+    tl.debug_barrier()
+
+    counts = tl.load(smem_ptrs, mask=expert_mask, other=0)
+    tl.store(tokens_cnts_ptr + off_c + expert_offsets, counts, mask=expert_mask)
+
+
+@triton.jit(do_not_specialize=["numel"])
 def moe_align_block_size_stage1(
     topk_ids_ptr,
     tokens_cnts_ptr,
     num_experts: tl.constexpr,
     numel,
-    tokens_per_thread,
+    tokens_per_thread: tl.constexpr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
     numel_sorted_token_ids: tl.constexpr,
@@ -44,24 +108,10 @@ def moe_align_block_size_stage1(
 
     off_c = (pid + 1) * num_experts
 
-    # Unroll loop by 4 for better instruction-level parallelism
-    UNROLL: tl.constexpr = 4
-    num_full_iters = tokens_per_thread // UNROLL
-
-    for iter_idx in range(num_full_iters):
-        base_i = iter_idx * UNROLL
-        for unroll_i in range(UNROLL):
-            i = base_i + unroll_i
-            if start_idx + i < numel:
-                idx = tl.load(topk_ids_ptr + start_idx + i)
-                token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
-                tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
-
-    for i in range(num_full_iters * UNROLL, tokens_per_thread):
-        if start_idx + i < numel:
-            idx = tl.load(topk_ids_ptr + start_idx + i)
-            token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
-            tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
+    offsets = start_idx + tl.arange(0, tokens_per_thread)
+    mask = offsets < numel
+    expert_id = tl.load(topk_ids_ptr + offsets, mask=mask, other=0)
+    tl.atomic_add(tokens_cnts_ptr + off_c + expert_id, 1, mask=mask)
 
 
 @triton.jit
@@ -97,16 +147,18 @@ def moe_align_block_size_stage3(
     tokens_cnts_ptr,
     cumsum_ptr,
     num_experts: tl.constexpr,
+    num_experts_next_power_of_2: tl.constexpr,
     block_size: tl.constexpr,
 ):
     off_cnt = num_experts * num_experts
 
-    expert_offsets = tl.arange(0, num_experts)
-    token_cnts = tl.load(tokens_cnts_ptr + off_cnt + expert_offsets)
+    expert_offsets = tl.arange(0, num_experts_next_power_of_2)
+    mask = expert_offsets < num_experts
+    token_cnts = tl.load(tokens_cnts_ptr + off_cnt + expert_offsets, mask=mask)
     aligned_cnts = tl.cdiv(token_cnts, block_size) * block_size
 
     cumsum_values = tl.cumsum(aligned_cnts, axis=0)
-    tl.store(cumsum_ptr + 1 + expert_offsets, cumsum_values)
+    tl.store(cumsum_ptr + 1 + expert_offsets, cumsum_values, mask=mask)
 
     total_tokens = tl.sum(aligned_cnts, axis=0)
     tl.store(total_tokens_post_pad_ptr, total_tokens)
@@ -159,9 +211,6 @@ def moe_align_block_size_triton(
     # to prevent out-of-bounds address access.
 
     grid = (num_experts,)
-    tokens_cnts = torch.zeros(
-        (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
-    )
     cumsum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
     tokens_per_thread = triton.next_power_of_2(ceil_div(numel, num_experts))
 
@@ -170,19 +219,41 @@ def moe_align_block_size_triton(
     )
     block_size_expert = triton.next_power_of_2(ceil_div(numel_expert_ids, num_experts))
 
-    moe_align_block_size_stage1[grid](
-        topk_ids,
-        tokens_cnts,
-        num_experts,
-        numel,
-        tokens_per_thread,
-        sorted_token_ids,
-        expert_ids,
-        numel_sorted_token_ids,
-        numel_expert_ids,
-        block_size_sorted,
-        block_size_expert,
+    tokens_cnts = torch.zeros(
+        (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
     )
+    num_experts_next_power_of_2 = triton.next_power_of_2(num_experts)
+    block_expert = triton.cdiv(num_experts, 32) * 32
+
+    if HAS_TLE:
+        moe_align_block_size_stage1_tle[grid](
+            topk_ids,
+            tokens_cnts,
+            num_experts,
+            numel,
+            tokens_per_thread,
+            sorted_token_ids,
+            expert_ids,
+            numel_sorted_token_ids,
+            numel_expert_ids,
+            block_size_sorted,
+            block_size_expert,
+            BLOCK_EXPERT=block_expert,
+        )
+    else:
+        moe_align_block_size_stage1[grid](
+            topk_ids,
+            tokens_cnts,
+            num_experts,
+            numel,
+            tokens_per_thread,
+            sorted_token_ids,
+            expert_ids,
+            numel_sorted_token_ids,
+            numel_expert_ids,
+            block_size_sorted,
+            block_size_expert,
+        )
     if num_experts == triton.next_power_of_2(num_experts):
         moe_align_block_size_stage2_vec[grid](
             tokens_cnts,
@@ -198,6 +269,7 @@ def moe_align_block_size_triton(
         tokens_cnts,
         cumsum,
         num_experts,
+        num_experts_next_power_of_2,
         block_size,
     )
     moe_align_block_size_stage4[grid](
