@@ -308,3 +308,9 @@ ConcatAndCacheMLABenchmark:
     - [64, 8, 21, 8, 4]
     - [512, 64, 42, 16, 8]
     - [1024, 64, 84, 16, 8]
+
+ReshapeAndCacheFlashBenchmark:
+  shapes:
+    - [42, 8, 64, 8, 1024]
+    - [42, 8, 80, 16, 10000]
+
