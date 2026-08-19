@@ -13,16 +13,168 @@
 # limitations under the License.
 
 import logging
+import math
+from pathlib import Path
 
 import torch
 import triton
 import triton.language as tl
 
 from flag_gems.ops.topk import _get_finfo_val, _get_iinfo_val, argsort
-from flag_gems.runtime import torch_device_fn
+from flag_gems.runtime import device, torch_device_fn
 from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
+
+_SMALL_SORT_LIMIT = 4096
+_LARGE_TILE = 2048
+_RAW_SOURCE = Path(__file__).with_name("sort_tle_raw.cu")
+
+_TLE_RAW_IMPORT_ERROR = None
+try:
+    import triton.experimental.tle.language.raw as tle_raw
+    from triton.experimental.tle.raw import dialect
+except (AttributeError, ImportError, ModuleNotFoundError) as exc:
+    dialect = None
+    tle_raw = None
+    _TLE_RAW_IMPORT_ERROR = exc
+
+if _TLE_RAW_IMPORT_ERROR is None and not _RAW_SOURCE.is_file():
+    _TLE_RAW_IMPORT_ERROR = FileNotFoundError(
+        f"packaged TLE-Raw source is missing: {_RAW_SOURCE}"
+    )
+
+
+def _require_tle_raw():
+    if _TLE_RAW_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "NVIDIA FP16/BF16 sort requires FlagTree 3.6 with TLE-Raw and "
+            "its LLVM/MLIR Python runtime"
+        ) from _TLE_RAW_IMPORT_ERROR
+
+
+if _TLE_RAW_IMPORT_ERROR is None:
+
+    @dialect(name="cuda", file=_RAW_SOURCE, extern_func_name="SortSmall", deferred=True)
+    def _sort_small_raw(*args, **kwargs): ...
+
+    @dialect(
+        name="cuda",
+        file=_RAW_SOURCE,
+        extern_func_name="SortHistogram",
+        deferred=True,
+    )
+    def _sort_histogram_raw(*args, **kwargs): ...
+
+    @dialect(
+        name="cuda", file=_RAW_SOURCE, extern_func_name="SortPrefix", deferred=True
+    )
+    def _sort_prefix_raw(*args, **kwargs): ...
+
+    @dialect(name="cuda", file=_RAW_SOURCE, extern_func_name="SortSweep", deferred=True)
+    def _sort_sweep_raw(*args, **kwargs): ...
+
+    @libentry()
+    @triton.jit
+    def _sort_small_kernel_raw(
+        input_ptr,
+        output_ptr,
+        output_indices_ptr,
+        rows,
+        n,
+        dtype_kind,
+        descending,
+        return_values,
+    ):
+        tle_raw.call(
+            _sort_small_raw,
+            [
+                input_ptr,
+                output_ptr,
+                output_indices_ptr,
+                rows,
+                n,
+                dtype_kind,
+                descending,
+                return_values,
+            ],
+            output_indices=[],
+        )
+
+    @libentry()
+    @triton.jit
+    def _sort_histogram_kernel_raw(
+        input_ptr,
+        histogram_ptr,
+        status_ptr,
+        rows,
+        n,
+        grid_n,
+        dtype_kind,
+        descending,
+    ):
+        tle_raw.call(
+            _sort_histogram_raw,
+            [
+                input_ptr,
+                histogram_ptr,
+                status_ptr,
+                rows,
+                n,
+                grid_n,
+                dtype_kind,
+                descending,
+            ],
+            output_indices=[],
+        )
+
+    @libentry()
+    @triton.jit
+    def _sort_prefix_kernel_raw(histogram_ptr, prefix_ptr, rows, grid_n):
+        tle_raw.call(
+            _sort_prefix_raw,
+            [histogram_ptr, prefix_ptr, rows, grid_n],
+            output_indices=[],
+        )
+
+    @libentry()
+    @triton.jit
+    def _sort_sweep_kernel_raw(
+        input_values_ptr,
+        input_indices_ptr,
+        output_values_ptr,
+        output_indices32_ptr,
+        output_indices64_ptr,
+        prefix_ptr,
+        status_ptr,
+        rows,
+        n,
+        grid_n,
+        dtype_kind,
+        descending,
+        pass_id,
+        return_values,
+    ):
+        tle_raw.call(
+            _sort_sweep_raw,
+            [
+                input_values_ptr,
+                input_indices_ptr,
+                output_values_ptr,
+                output_indices32_ptr,
+                output_indices64_ptr,
+                prefix_ptr,
+                status_ptr,
+                rows,
+                n,
+                grid_n,
+                dtype_kind,
+                descending,
+                pass_id,
+                return_values,
+            ],
+            output_indices=[],
+        )
 
 
 def unwrap_if_constexpr(o):
@@ -340,6 +492,163 @@ def radix_sort(arr, k_bits=8, descending=False):
     return arr_in, indices_in
 
 
+def _use_tle_raw(inp):
+    return device.vendor_name == "nvidia" and inp.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    )
+
+
+def _dtype_kind(dtype):
+    # The CUDA implementation uses 0 for IEEE fp16 and 1 for bfloat16.
+    return 0 if dtype == torch.float16 else 1
+
+
+def _sort_half_contiguous(inp, descending, return_values):
+    _require_tle_raw()
+    n = inp.shape[-1]
+    rows = math.prod(inp.shape) // n
+    dtype_kind = _dtype_kind(inp.dtype)
+    descending_flag = int(descending)
+    output_indices = torch.empty_like(inp, dtype=torch.int64)
+    output_values = torch.empty_like(inp) if return_values else inp
+
+    with torch_device_fn.device(inp.device):
+        if n <= _SMALL_SORT_LIMIT:
+            _sort_small_kernel_raw[(rows,)](
+                inp,
+                output_values,
+                output_indices,
+                rows,
+                n,
+                dtype_kind,
+                descending_flag,
+                int(return_values),
+                num_warps=8,
+                num_stages=1,
+            )
+            return (output_values if return_values else None), output_indices
+
+        if n >= 1 << 30:
+            raise RuntimeError(
+                "TLE-Raw sort supports fewer than 2**30 elements per row"
+            )
+
+        grid_n = triton.cdiv(n, _LARGE_TILE)
+        histogram = torch.empty(
+            (rows, grid_n, 2, 256), device=inp.device, dtype=torch.int32
+        )
+        prefix = torch.empty((rows, 2, 256), device=inp.device, dtype=torch.int32)
+        status = torch.empty(
+            (2, rows, grid_n, 256), device=inp.device, dtype=torch.int64
+        )
+        temporary_values = torch.empty_like(inp)
+        temporary_indices = torch.empty_like(inp, dtype=torch.int32)
+
+        tile_grid = (rows * grid_n,)
+        _sort_histogram_kernel_raw[tile_grid](
+            inp,
+            histogram,
+            status,
+            rows,
+            n,
+            grid_n,
+            dtype_kind,
+            descending_flag,
+            num_warps=8,
+            num_stages=1,
+        )
+        _sort_prefix_kernel_raw[(rows,)](
+            histogram,
+            prefix,
+            rows,
+            grid_n,
+            num_warps=8,
+            num_stages=1,
+        )
+        _sort_sweep_kernel_raw[tile_grid](
+            inp,
+            temporary_indices,
+            temporary_values,
+            temporary_indices,
+            output_indices,
+            prefix,
+            status,
+            rows,
+            n,
+            grid_n,
+            dtype_kind,
+            descending_flag,
+            0,
+            int(return_values),
+            num_warps=8,
+            num_stages=1,
+        )
+        _sort_sweep_kernel_raw[tile_grid](
+            temporary_values,
+            temporary_indices,
+            output_values,
+            temporary_indices,
+            output_indices,
+            prefix,
+            status,
+            rows,
+            n,
+            grid_n,
+            dtype_kind,
+            descending_flag,
+            1,
+            int(return_values),
+            num_warps=8,
+            num_stages=1,
+        )
+
+    return (output_values if return_values else None), output_indices
+
+
+def _prepare_sort_input(inp, dim):
+    if inp.ndim == 0:
+        raise IndexError("Dimension specified as -1 but tensor has no dimensions")
+    if dim < 0:
+        dim += inp.ndim
+    if dim < 0 or dim >= inp.ndim:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of "
+            f"[-{inp.ndim}, {inp.ndim - 1}], but got {dim})"
+        )
+    if dim != inp.ndim - 1:
+        return torch.movedim(inp, dim, -1).contiguous(), dim
+    return inp.contiguous(), dim
+
+
+def _sort_half_tle_raw(inp, dim, descending, return_values):
+    prepared, normalized_dim = _prepare_sort_input(inp, dim)
+    n = prepared.shape[-1]
+    if prepared.numel() == 0:
+        values = torch.empty_like(prepared) if return_values else None
+        indices = torch.empty_like(prepared, dtype=torch.int64)
+    elif n == 1:
+        values = prepared.clone() if return_values else None
+        indices = torch.zeros_like(prepared, dtype=torch.int64)
+    else:
+        values, indices = _sort_half_contiguous(
+            prepared, descending=descending, return_values=return_values
+        )
+
+    if normalized_dim != inp.ndim - 1:
+        if values is not None:
+            values = torch.movedim(values, -1, normalized_dim)
+        indices = torch.movedim(indices, -1, normalized_dim)
+    return values, indices
+
+
+def _argsort_tle_raw(inp, dim=-1, descending=False):
+    _, indices = _sort_half_tle_raw(
+        inp, dim=dim, descending=descending, return_values=False
+    )
+    return indices
+
+
 @libentry()
 @triton.jit()
 def sort_kernel(
@@ -384,6 +693,11 @@ def sort_stable(inp, *, stable, dim=-1, descending=False):
     logger.debug("GEMS SORT.STABLE")
     # We only implement stable radix sort here
     _ = stable
+    if _use_tle_raw(inp):
+        return _sort_half_tle_raw(
+            inp, dim=dim, descending=descending, return_values=True
+        )
+
     sort_elem_cnt = inp.shape[dim]
     if sort_elem_cnt == 1:
         return inp, torch.zeros_like(inp, dtype=torch.int64)

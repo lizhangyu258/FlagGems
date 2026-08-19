@@ -14,7 +14,7 @@
 
 import logging
 
-from flag_gems.ops.sort import sort_stable
+from flag_gems.ops.sort import _argsort_tle_raw, _use_tle_raw, sort_stable
 
 logger = logging.getLogger(__name__)
 
@@ -25,5 +25,7 @@ def argsort(inp, dim=-1, descending=False):
     This is equivalent to calling torch.sort and returning only the indices.
     """
     logger.debug("GEMS ARGSORT")
+    if _use_tle_raw(inp):
+        return _argsort_tle_raw(inp, dim=dim, descending=descending)
     _, indices = sort_stable(inp, stable=True, dim=dim, descending=descending)
     return indices
